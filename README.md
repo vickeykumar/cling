@@ -36,6 +36,9 @@ Installation
 ### Release Notes
 See our [release notes](docs/ReleaseNotes.md) to find what's new.
 
+### using gold*
+#!/bin/bash
+/usr/bin/ld.gold --strip-all --no-map-whole-files --no-keep-memory --no-keep-files-mapped $@
 
 ### Binaries
 Our nightly binary snapshots can be found

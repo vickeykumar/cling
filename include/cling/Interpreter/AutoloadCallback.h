@@ -45,7 +45,7 @@ namespace cling {
     //virtual functions ARE meant to be overriden!
 
 //    bool LookupObject (clang::LookupResult &R, clang::Scope *);
-    bool LookupObject (clang::TagDecl* t);
+    bool LookupObject (clang::TagDecl* t) override;
 
     void InclusionDirective(clang::SourceLocation HashLoc,
                             const clang::Token &IncludeTok,
@@ -55,8 +55,9 @@ namespace cling {
                             const clang::FileEntry *File,
                             llvm::StringRef SearchPath,
                             llvm::StringRef RelativePath,
-                            const clang::Module *Imported);
-    void TransactionCommitted(const Transaction& T);
+                            const clang::Module *Imported,
+                            clang::SrcMgr::CharacteristicKind FileType) override;
+    void TransactionCommitted(const Transaction& T) override;
 
   private:
     void report(clang::SourceLocation l, llvm::StringRef name,

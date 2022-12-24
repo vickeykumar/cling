@@ -10,7 +10,7 @@
 #include "DeclUnloader.h"
 
 #include "cling/Utils/AST.h"
-#ifdef LLVM_ON_WIN32
+#ifdef _WIN32
 #include "cling/Utils/Diagnostics.h"
 #endif
 
@@ -29,10 +29,19 @@
 namespace cling {
 using namespace clang;
 
-bool DeclUnloader::isDefinition(TagDecl* R) {
-  return R->isCompleteDefinition() && isa<CXXRecordDecl>(R);
+///\brief Return whether `D' is a template that was first instantiated non-
+/// locally, i.e. in a PCH/module. If `D' is not an instantiation, return false.
+bool DeclUnloader::isInstantiatedInPCH(const Decl *D) {
+  SourceManager &SM = D->getASTContext().getSourceManager();
+  if (const auto FD = dyn_cast<FunctionDecl>(D))
+    return FD->isTemplateInstantiation() &&
+           !SM.isLocalSourceLocation(FD->getPointOfInstantiation());
+  else if (const auto CTSD = dyn_cast<ClassTemplateSpecializationDecl>(D))
+    return !SM.isLocalSourceLocation(CTSD->getPointOfInstantiation());
+  else if (const auto VTSD = dyn_cast<VarTemplateSpecializationDecl>(D))
+    return !SM.isLocalSourceLocation(VTSD->getPointOfInstantiation());
+  return false;
 }
-
 
 void DeclUnloader::resetDefinitionData(TagDecl *decl) {
   auto canon = dyn_cast<CXXRecordDecl>(decl->getCanonicalDecl());
@@ -45,11 +54,21 @@ void DeclUnloader::resetDefinitionData(TagDecl *decl) {
   }
 }
 
+constexpr static bool isDefinition(void*) { return false; }
+static bool isDefinition(TagDecl* R) {
+  return R->isCompleteDefinition() && isa<CXXRecordDecl>(R);
+}
+
 // Copied and adapted from: ASTReaderDecl.cpp
 template<typename DeclT>
-void DeclUnloader::removeRedeclFromChain(DeclT* R) {
+static void removeRedeclFromChain(DeclT* R) {
   //RedeclLink is a protected member.
   struct RedeclDerived : public Redeclarable<DeclT> {
+     // FIXME: Report this false positive diagnostic to clang.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-local-typedef"
+#endif // __clang__
     typedef typename Redeclarable<DeclT>::DeclLink DeclLink_t;
     static DeclLink_t& getLink(DeclT* LR) {
       Redeclarable<DeclT>* D = LR;
@@ -71,6 +90,9 @@ void DeclUnloader::removeRedeclFromChain(DeclT* R) {
         = DeclLink_t(DeclLink_t::LatestLink, First->getASTContext());
       getLink(First).setLatest(Latest);
     }
+#ifdef __clang__
+#pragma clang diagnostic push
+#endif // __clang__
   };
 
   assert(R != R->getFirstDecl() && "Cannot remove only redecl from chain");
@@ -106,7 +128,7 @@ void DeclUnloader::removeRedeclFromChain(DeclT* R) {
   // DefinitionData pointing to it.
   // This is really need only if DeclT is a TagDecl or derived.
   if (isdef) {
-    resetDefinitionData(Prev);
+     DeclUnloader::resetDefinitionData(Prev);
   }
 }
 
@@ -153,8 +175,7 @@ static Decl* handleRedelaration(Decl* D, DeclContext* DC) {
       };
       if (!hasDecl(decls, MostRecentNotThis) && hasDecl(decls, ND)) {
         // The decl was registered in the lookup, update it.
-        Pos->second.HandleRedeclaration(MostRecentNotThis,
-                                        /*IsKnownNewer*/ true);
+        Pos->second.addOrReplaceDecl(MostRecentNotThis);
       }
     }
   }
@@ -276,7 +297,7 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
 
         for (unsigned i = 0, e = Inits->getNumOperands(); i != e; ++i) {
           llvm::Value *Operand
-            = Inits->getOperand(i)->stripPointerCastsNoFollowAliases();
+            = Inits->getOperand(i)->stripPointerCasts();
           VisitedGlobals.erase(cast<llvm::GlobalValue>(Operand));
         }
 
@@ -371,18 +392,16 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
 
   bool DeclUnloader::VisitDecl(Decl* D) {
     assert(D && "The Decl is null");
-    CollectFilesToUncache(D->getLocStart());
+    CollectFilesToUncache(D->getBeginLoc());
 
     DeclContext* DC = D->getLexicalDeclContext();
 
-    bool Successful = true;
     if (DC->containsDecl(D))
       DC->removeDecl(D);
 
-    // With the bump allocator this is nop.
-    if (Successful)
-      m_Sema->getASTContext().Deallocate(D);
-    return Successful;
+    // With the bump allocator this is a no-op.
+    m_Sema->getASTContext().Deallocate(D);
+    return true;
   }
 
   // Remove a decl and possibly it's parent entry in lookup tables.
@@ -391,54 +410,24 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
     // Make sure we the decl doesn't exist in the lookup tables.
     StoredDeclsMap::iterator Pos = Map->find(ND->getDeclName());
     if (Pos != Map->end()) {
-      // Most decls only have one entry in their list, special case it.
-      if (Pos->second.getAsDecl() == ND) {
-        // This is the only decl, no need to call Pos->second.remove(ND);
-        // as it only sets data to nullptr, just remove the entire entry
+      StoredDeclsList &List = Pos->second;
+      // In some cases clang puts an entry in the list without a decl pointer.
+      // Clean it up.
+      if (List.isNull()) {
         Map->erase(Pos);
+        return;
       }
-      else if (StoredDeclsList::DeclsTy* Vec = Pos->second.getAsVector()) {
-        // Otherwise iterate over the list with entries with the same name.
-        for (NamedDecl* NDi : *Vec) {
-          if (NDi == ND)
-            Pos->second.remove(ND);
-        }
-        if (Vec->empty())
-          Map->erase(Pos);
-      }
-      else if (Pos->second.isNull()) // least common case
+      List.remove(ND);
+      if (List.isNull())
         Map->erase(Pos);
     }
   }
-
-#ifndef NDEBUG
-  // Make sure we the decl doesn't exist in the lookup tables.
-  static void checkDeclIsGone(StoredDeclsMap* Map, NamedDecl* ND) {
-    assert(Map && ND && "checkDeclIsGone recieved NULL value(s)");
-    StoredDeclsMap::iterator Pos = Map->find(ND->getDeclName());
-    if ( Pos != Map->end()) {
-      // Most decls only have one entry in their list, special case it.
-      if (NamedDecl* OldD = Pos->second.getAsDecl())
-        assert(OldD != ND && "Lookup entry still exists.");
-      else if (StoredDeclsList::DeclsTy* Vec = Pos->second.getAsVector()) {
-        // Otherwise iterate over the list with entries with the same name.
-        // TODO: Walk the redeclaration chain if the entry was a redeclaration.
-
-        for (StoredDeclsList::DeclsTy::const_iterator I = Vec->begin(),
-               E = Vec->end(); I != E; ++I)
-          assert(*I != ND && "Lookup entry still exists.");
-      }
-      else
-        assert(Pos->second.isNull() && "!?");
-    }
-  }
-#endif
 
   bool DeclUnloader::VisitNamedDecl(NamedDecl* ND) {
     bool Successful = VisitDecl(ND);
 
     DeclContext* DC = ND->getDeclContext();
-    while (DC->isTransparentContext())
+    while (DC->isTransparentContext() || DC->isInlineNamespace())
       DC = DC->getLookupParent();
 
     // if the decl was anonymous we are done.
@@ -456,12 +445,9 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
 
     // Cleanup the lookup tables.
     // DeclContexts like EnumDecls don't have lookup maps.
-    if (StoredDeclsMap* Map = DC->getPrimaryContext()->getLookupPtr()) {
+    // FIXME: Remove once we upstream this patch: D119675
+    if (StoredDeclsMap* Map = DC->getPrimaryContext()->getLookupPtr())
       eraseDeclFromMap(Map, ND);
-#ifndef NDEBUG
-      checkDeclIsGone(Map, ND);
-#endif
-    }
 
     return Successful;
   }
@@ -486,7 +472,7 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
     Successful &= VisitNamedDecl(USD);
 
     // Unregister from the using decl that it shadows.
-    USD->getUsingDecl()->removeShadowDecl(USD);
+    USD->getIntroducer()->removeShadowDecl(USD);
 
     return Successful;
   }
@@ -597,9 +583,9 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
 
         // Collect all the specializations without the one to remove.
         for(Set::const_iterator I = specs.begin(),E = specs.end(); I != E; ++I){
-          assert(I->Function && "Must have a specialization.");
-          if (I->Function != specialization)
-            specializations.push_back(I->Function);
+          assert(I->getFunction() && "Must have a specialization.");
+          if (I->getFunction() != specialization)
+            specializations.push_back(I->getFunction());
         }
 
         This->getCommonPtr()->Specializations.clear();
@@ -713,6 +699,22 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
   }
 
   bool DeclUnloader::VisitNamespaceDecl(NamespaceDecl* NSD) {
+    // The first declaration of an unnamed namespace, creates an implicit
+    // UsingDirectiveDecl that makes the names available in the parent DC (see
+    // `Sema::ActOnStartNamespaceDef()`).
+    // If we are reverting such first declaration, make sure we reset the
+    // anonymous namespace for the parent DeclContext so that the
+    // implicit UsingDirectiveDecl is created again when parsing the next
+    // anonymous namespace.
+    if (NSD->isAnonymousNamespace() && NSD->isFirstDecl()) {
+      auto Parent = NSD->getParent();
+      if (auto TU = dyn_cast<TranslationUnitDecl>(Parent)) {
+        TU->setAnonymousNamespace(nullptr);
+      } else if (auto NS = dyn_cast<NamespaceDecl>(Parent)) {
+        NS->setAnonymousNamespace(nullptr);
+      }
+    }
+
     // NamespaceDecl: NamedDecl, DeclContext, Redeclarable
     bool Successful = VisitDeclContext(NSD);
     Successful &= VisitRedeclarable(NSD, NSD->getDeclContext());
@@ -799,8 +801,7 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
   }
 
   void DeclUnloader::MaybeRemoveDeclFromModule(GlobalDecl& GD) const {
-    if (!m_CurTransaction
-        || !m_CurTransaction->getModule()) // syntax-only mode exit
+    if (!m_CurTransaction || !m_CodeGen) // syntax-only mode exit
       return;
 
     using namespace llvm;
@@ -843,7 +844,7 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
 
       std::string mangledName;
       {
-#if LLVM_ON_WIN32
+#if _WIN32
         // clang cannot mangle everything in the ms-abi.
 #ifndef NDEBUG
         utils::DiagnosticsStore Errors(m_Sema->getDiagnostics(), false, false);
@@ -867,12 +868,14 @@ bool DeclUnloader::VisitRedeclarable(clang::Redeclarable<T>* R, DeclContext* DC)
         }
       }
 
-      auto M = m_CurTransaction->getModule();
-      GlobalValue* GV = M->getNamedValue(mangledName);
-      if (GV) { // May be deferred decl and thus 0
-        GlobalValueEraser GVEraser(m_CodeGen);
-        GVEraser.EraseGlobalValue(GV);
+      if (auto M = m_CurTransaction->getModule()) {
+        GlobalValue* GV = M->getNamedValue(mangledName);
+        if (GV) { // May be deferred decl and thus 0
+          GlobalValueEraser GVEraser(m_CodeGen);
+          GVEraser.EraseGlobalValue(GV);
+        }
       }
+      // DeferredDecls exist even without Module.
       m_CodeGen->forgetDecl(GD, mangledName);
     }
   }

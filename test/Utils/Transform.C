@@ -6,7 +6,7 @@
 // LICENSE.TXT for details.
 //------------------------------------------------------------------------------
 
-// RUN: cat %s | %built_cling -fno-rtti | FileCheck %s
+// RUN: cat %s | %cling -fno-rtti | FileCheck %s
 
 // The test verifies the expected behavior in cling::utils::Transform class,
 // which is supposed to provide different transformation of AST nodes and types.
@@ -215,6 +215,7 @@ Transform::GetPartiallyDesugaredType(Ctx, QT, transConfig).getAsString().c_str()
 clang::PrintingPolicy Policy(Ctx.getPrintingPolicy());
 Policy.SuppressTagKeyword = true; // Never get the class or struct keyword
 Policy.SuppressScope = true;      // Force the scope to be coming from a clang::ElaboratedType.
+Policy.SplitTemplateClosers = true; // Print a<b<c> >' rather than 'a<b<c>>'.
 std::string name;
 Transform::GetPartiallyDesugaredType(Ctx, QT, transConfig).getAsStringInternal(name,Policy);
 name.c_str()

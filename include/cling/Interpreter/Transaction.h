@@ -27,6 +27,7 @@ namespace clang {
   class FunctionDecl;
   class IdentifierInfo;
   class NamedDecl;
+  class NamespaceDecl;
   class MacroDirective;
   class Preprocessor;
   struct PrintingPolicy;
@@ -138,13 +139,33 @@ namespace cling {
 
     unsigned m_IssuedDiags : 2;
 
+    ///\brief the Transaction is currently being unloaded. Currently,
+    /// used for ensuring system consistency when unloading transactions.
+    ///
+    bool m_Unloading : 1;
+
     ///\brief Options controlling the transformers and code generator.
     ///
     CompilationOptions m_Opts;
 
+    ///\brief If DefinitionShadower is enabled, the `__cling_N5xxx' namespace
+    /// in which to nest global definitions (if any).
+    ///
+    clang::NamespaceDecl* m_DefinitionShadowNS = nullptr;
+
     ///\brief The llvm Module containing the information that we will revert
     ///
-    std::shared_ptr<llvm::Module> m_Module;
+    std::unique_ptr<llvm::Module> m_Module;
+
+    ///\brief This is a hack to get code unloading to work with ORCv2
+    ///
+    /// ORCv2 introduces resource trackers that allow code unloading from any
+    /// materialization state. ORCv2 IncrementalJIT reports modules as non-
+    /// pending immediately, which sets this raw pointer. TransactionUnloader
+    /// now checks this one instead of the unique pointer above. This is not
+    /// nice, but it works and keeps the current infrastrucutre intact.
+    /// See TransactionUnloader::unloadModule
+    const llvm::Module *m_CompiledModule{nullptr};
 
     ///\brief The Executor to use m_ExeUnload on.
     ///
@@ -178,8 +199,9 @@ namespace cling {
 
     /// TransactionPool needs direct access to m_State as setState asserts
     friend class TransactionPool;
+    friend class IncrementalJIT;
 
-    void Initialize(clang::Sema& S);
+    void Initialize();
 
   public:
     enum State {
@@ -302,6 +324,8 @@ namespace cling {
       m_State = val;
     }
 
+    void setUnloading() { m_Unloading = true; }
+
     IssuedDiags getIssuedDiags() const {
       return static_cast<IssuedDiags>(getTopmostParent()->m_IssuedDiags);
     }
@@ -315,6 +339,11 @@ namespace cling {
       assert(getState() == kCollecting && "Something wrong with you?");
       m_Opts = CO;
     }
+
+    clang::NamespaceDecl* getDefinitionShadowNS() const
+    { return m_DefinitionShadowNS; }
+
+    void setDefinitionShadowNS(clang::NamespaceDecl* NS);
 
     ///\brief Returns the first declaration of the transaction.
     ///
@@ -455,8 +484,14 @@ namespace cling {
         m_NestedTransactions->clear();
     }
 
-    std::shared_ptr<llvm::Module> getModule() const { return m_Module; }
+    llvm::Module* getModule() const { return m_Module.get(); }
+    std::unique_ptr<llvm::Module> takeModule () {
+      assert(getModule());
+      return std::move(m_Module);
+    }
     void setModule(std::unique_ptr<llvm::Module> M) { m_Module = std::move(M); }
+
+    const llvm::Module* getCompiledModule() const { return m_CompiledModule; }
 
     IncrementalExecutor* getExecutor() const { return m_Exe; }
 

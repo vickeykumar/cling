@@ -11,14 +11,13 @@
 
 #include "ASTTransformer.h"
 #include "AutoSynthesizer.h"
-#include "BackendPasses.h"
 #include "CheckEmptyTransactionTransformer.h"
 #include "ClingPragmas.h"
 #include "DeclCollector.h"
 #include "DeclExtractor.h"
+#include "DefinitionShadower.h"
+#include "DeviceKernelInliner.h"
 #include "DynamicLookup.h"
-#include "IncrementalCUDADeviceCompiler.h"
-#include "IncrementalExecutor.h"
 #include "NullDerefProtectionTransformer.h"
 #include "TransactionPool.h"
 #include "ValueExtractionSynthesizer.h"
@@ -106,8 +105,23 @@ namespace {
     return false;
   }
 
+  /// \brief Overrides the current DiagnosticConsumer to supress many warnings
+  /// issued as a result of incremental compilation (see `HandleDiagnostic()`).
+  ///
+  /// Diagnostics passing the filter are, by default, forwarded to the previous
+  /// DiagnosticConsumer instance.  A different consumer may be specified via
+  /// `setTargetConsumer()`.
+  /// In that case, given that internal state might be updated as part of
+  /// `{Begin,End}SourceFile` (e.g. in TextDiagnosticPrinter), calls to such
+  /// functions will be forwarded to both, the user-specified and the original
+  /// consumer; however `HandleDiagnostic()` calls shall only be seen by the
+  /// former.
+  ///
+  /// On destruction, the original (i.e. overridden consumer) is restored.
+  ///
   class FilteringDiagConsumer : public cling::utils::DiagnosticsOverride {
     std::stack<bool> m_IgnorePromptDiags;
+    llvm::PointerIntPair<DiagnosticConsumer*, 1, bool /*Own*/> m_Target{};
 
     void SyncDiagCountWithTarget() {
       NumWarnings = m_PrevClient.getNumWarnings();
@@ -117,20 +131,28 @@ namespace {
     void BeginSourceFile(const LangOptions &LangOpts,
                          const Preprocessor *PP=nullptr) override {
       m_PrevClient.BeginSourceFile(LangOpts, PP);
+      if (auto C = m_Target.getPointer())
+        C->BeginSourceFile(LangOpts, PP);
     }
 
     void EndSourceFile() override {
       m_PrevClient.EndSourceFile();
+      if (auto C = m_Target.getPointer())
+        C->EndSourceFile();
       SyncDiagCountWithTarget();
     }
 
     void finish() override {
       m_PrevClient.finish();
+      if (auto C = m_Target.getPointer())
+        C->finish();
       SyncDiagCountWithTarget();
     }
 
     void clear() override {
       m_PrevClient.clear();
+      if (auto C = m_Target.getPointer())
+        C->clear();
       SyncDiagCountWithTarget();
     }
 
@@ -158,7 +180,19 @@ namespace {
           return; // ignore!
         }
       }
-      m_PrevClient.HandleDiagnostic(DiagLevel, Info);
+
+      // In principle, for simplicity, we preserve the old behavior of
+      // delivering diagnostics to just one consumer (that is why we don't emit
+      // to both), but we allow the "sink" to be changed.
+      // Note, however, that consumers might update their internal state in
+      // calls to, e.g. `BeginSourceFile()` or `EndSourceFile()` (actually,
+      // `TextDiagnosticPrinter` is an example of this), so in order to be able
+      // to restore the original consumer, we need to keep forwarding these
+      // calls also to `m_PrevClient` (see above).
+      if (auto C = m_Target.getPointer())
+        C->HandleDiagnostic(DiagLevel, Info);
+      else
+        m_PrevClient.HandleDiagnostic(DiagLevel, Info);
       SyncDiagCountWithTarget();
     }
 
@@ -167,9 +201,26 @@ namespace {
     }
 
   public:
-    FilteringDiagConsumer(DiagnosticsEngine& Diags, bool Own) :
-      DiagnosticsOverride(Diags, Own) {
+    FilteringDiagConsumer(DiagnosticsEngine& Diags, bool Own)
+      : DiagnosticsOverride(Diags, Own) {}
+    virtual ~FilteringDiagConsumer() { setTargetConsumer(nullptr); }
+
+    /// \brief Sets the DiagnosticConsumer that sees `HandleDiagnostic()` calls.
+    /// \param[in] Consumer - The target DiagnosticConsumer, or `nullptr` to
+    ///    revert to original client.
+    /// \param[in] Own - Whether we own the pointee
+    ///
+    void setTargetConsumer(DiagnosticConsumer* Consumer, bool Own = false) {
+      if (m_Target.getInt())
+        if (auto C = m_Target.getPointer())
+          delete C;
+
+      m_Target.setPointer(Consumer);
+      m_Target.setInt(Own);
     }
+
+    DiagnosticConsumer* getTargetConsumer() const
+    { return m_Target.getPointer(); }
 
     struct RAAI {
       FilteringDiagConsumer& m_Client;
@@ -222,7 +273,7 @@ static void HandlePlugins(CompilerInstance& CI,
     PluginASTAction::ActionType PluginActionType = P->getActionType();
     assert(PluginActionType != clang::PluginASTAction::ReplaceAction);
 
-    if (P->ParseArgs(CI, CI.getFrontendOpts().PluginArgs[it->getName()])) {
+    if (P->ParseArgs(CI, CI.getFrontendOpts().PluginArgs[it->getName().str()])) {
       std::unique_ptr<ASTConsumer> PluginConsumer
         = P->CreateASTConsumer(CI, /*InputFile*/ "");
       if (PluginActionType == clang::PluginASTAction::AddBeforeMainAction)
@@ -239,7 +290,7 @@ namespace cling {
       : m_Interpreter(interp) {
     std::unique_ptr<cling::DeclCollector> consumer;
     consumer.reset(m_Consumer = new cling::DeclCollector());
-    m_CI.reset(CIFactory::createCI("", interp->getOptions(), llvmdir,
+    m_CI.reset(CIFactory::createCI("\n", interp->getOptions(), llvmdir,
                                    std::move(consumer), moduleExtensions));
 
     if (!m_CI) {
@@ -286,34 +337,6 @@ namespace cling {
     m_DiagConsumer.reset(new FilteringDiagConsumer(Diag, false));
 
     initializeVirtualFile();
-
-    if(m_CI->getFrontendOpts().ProgramAction != frontend::ParseSyntaxOnly &&
-      m_Interpreter->getOptions().CompilerOpts.CUDA){
-        // Create temporary folder for all files, which the CUDA device compiler
-        // will generate.
-        llvm::SmallString<256> TmpPath;
-        llvm::StringRef sep = llvm::sys::path::get_separator().data();
-        llvm::sys::path::system_temp_directory(false, TmpPath);
-        TmpPath.append(sep.data());
-        TmpPath.append("cling-%%%%");
-        TmpPath.append(sep.data());
-
-        llvm::SmallString<256> TmpFolder;
-        llvm::sys::fs::createUniqueFile(TmpPath.c_str(), TmpFolder);
-        llvm::sys::fs::create_directory(TmpFolder);
-
-        // The CUDA fatbin file is the connection beetween the CUDA device
-        // compiler and the CodeGen of cling. The file will every time reused.
-        if(getCI()->getCodeGenOpts().CudaGpuBinaryFileNames.empty())
-          getCI()->getCodeGenOpts().CudaGpuBinaryFileNames.push_back(
-            std::string(TmpFolder.c_str()) + "cling.fatbin");
-
-        m_CUDACompiler.reset(
-          new IncrementalCUDADeviceCompiler(TmpFolder.c_str(),
-                                            m_CI->getCodeGenOpts().OptimizationLevel,
-                                            m_Interpreter->getOptions(),
-                                            *m_CI));
-    }
   }
 
   bool
@@ -335,7 +358,7 @@ namespace cling {
       Transaction* PchT = beginTransaction(CO);
       DiagnosticErrorTrap Trap(Diags);
       m_CI->createPCHExternalASTSource(PCHFileName,
-                                       true /*DisablePCHValidation*/,
+                                       DisableValidationForModuleKind::All,
                                        true /*AllowPCHWithCompilerErrors*/,
                                        0 /*DeserializationListener*/,
                                        true /*OwnsDeserializationListener*/);
@@ -392,14 +415,47 @@ namespace cling {
            && (!initialized || (m_TransactionPool && m_Parser));
   }
 
+  namespace {
+    template <class T>
+    struct Reversed {
+      const T &m_orig;
+      auto begin() -> decltype(m_orig.rbegin()) { return m_orig.rbegin(); }
+      auto end() -> decltype (m_orig.rend()) { return m_orig.rend(); }
+    };
+    template <class T>
+    Reversed<T> reverse(const T& orig) { return {orig}; }
+  }
+
+  const Transaction* IncrementalParser::getLastWrapperTransaction() const {
+    if (auto *T = getCurrentTransaction())
+      if (T->getWrapperFD())
+        return T;
+
+    for (auto T: reverse(m_Transactions))
+      if (T->getWrapperFD())
+        return T;
+    return nullptr;
+  }
+
   const Transaction* IncrementalParser::getCurrentTransaction() const {
     return m_Consumer->getTransaction();
   }
 
-  SourceLocation IncrementalParser::getLastMemoryBufferEndLoc() const {
+  void IncrementalParser::setDiagnosticConsumer(DiagnosticConsumer* Consumer,
+						bool Own) {
+    static_cast<
+      FilteringDiagConsumer&>(*m_DiagConsumer).setTargetConsumer(Consumer, Own);
+  }
+
+  DiagnosticConsumer* IncrementalParser::getDiagnosticConsumer() const {
+    return static_cast<
+      FilteringDiagConsumer&>(*m_DiagConsumer).getTargetConsumer();
+  }
+
+  SourceLocation IncrementalParser::getNextAvailableUniqueSourceLoc() {
     const SourceManager& SM = getCI()->getSourceManager();
     SourceLocation Result = SM.getLocForStartOfFile(m_VirtualFileID);
-    return Result.getLocWithOffset(m_MemoryBuffers.size() + 1);
+    return Result.getLocWithOffset(m_VirtualFileLocOffset++);
   }
 
   IncrementalParser::~IncrementalParser() {
@@ -585,9 +641,11 @@ namespace cling {
       Transaction* prevConsumerT = m_Consumer->getTransaction();
       m_Consumer->setTransaction(T);
       Transaction* nestedT = beginTransaction(T->getCompilationOpts());
+      // Process used vtables and generate implicit bodies.
+      getCI()->getSema().DefineUsedVTables();
       // Pull all template instantiations in that came from the consumers.
       getCI()->getSema().PerformPendingInstantiations();
-#ifdef LLVM_ON_WIN32
+#ifdef _WIN32
       // Microsoft-specific:
       // Late parsed templates can leave unswallowed "macro"-like tokens.
       // They will seriously confuse the Parser when entering the next
@@ -662,6 +720,17 @@ namespace cling {
     // This llvm::Module is done; finalize it and pass it to the execution
     // engine.
     if (!T->isNestedTransaction() && hasCodeGenerator()) {
+      if (InterpreterCallbacks* callbacks = m_Interpreter->getCallbacks())
+        callbacks->TransactionCodeGenStarted(*T);
+
+      // Update CodeGen to current optimization level, which might be different
+      // from what it had when constructed.
+      auto &CGOpts = m_CI->getCodeGenOpts();
+      CGOpts.OptimizationLevel = T->getCompilationOpts().OptLevel;
+      CGOpts.setInlining((CGOpts.OptimizationLevel == 0)
+                         ? CodeGenOptions::OnlyAlwaysInlining
+                         : CodeGenOptions::NormalInlining);
+
       // The initializers are emitted to the symbol "_GLOBAL__sub_I_" + filename.
       // Make that unique!
       deserT = beginTransaction(CompilationOptions());
@@ -683,6 +752,9 @@ namespace cling {
         Diags.getClient()->clear();
       }
 
+      if (InterpreterCallbacks* callbacks = m_Interpreter->getCallbacks())
+        callbacks->TransactionCodeGenFinished(*T);
+
       // Create a new module.
       StartModule();
     }
@@ -696,11 +768,18 @@ namespace cling {
       Parent->removeNestedTransaction(&T);
       T.setParent(0);
     } else {
-      // Remove from the queue
-      assert(&T == m_Transactions.back() && "Out of order transaction removal");
-      m_Transactions.pop_back();
-      if (!m_Transactions.empty())
-        m_Transactions.back()->setNext(0);
+      if (&T == m_Transactions.back()) {
+        // Remove from the queue
+        m_Transactions.pop_back();
+        if (!m_Transactions.empty())
+          m_Transactions.back()->setNext(0);
+      } else {
+        // If T is not the last transaction it must not be a previous
+        // transaction either, but a "disconnected" one, i.e. one that
+        // was not yet committed.
+        assert(std::find(m_Transactions.begin(), m_Transactions.end(), &T)
+              == m_Transactions.end() && "Out of order transaction removal");
+      }
     }
 
     m_TransactionPool->releaseTransaction(&T);
@@ -797,10 +876,10 @@ namespace cling {
     // Create an uninitialized memory buffer, copy code in and append "\n"
     size_t InputSize = input.size(); // don't include trailing 0
     // MemBuffer size should *not* include terminating zero
-    std::unique_ptr<llvm::MemoryBuffer>
-      MB(llvm::MemoryBuffer::getNewUninitMemBuffer(InputSize + 1,
-                                                   source_name.str()));
-    char* MBStart = const_cast<char*>(MB->getBufferStart());
+    std::unique_ptr<llvm::WritableMemoryBuffer>
+      MB(llvm::WritableMemoryBuffer::getNewUninitMemBuffer(InputSize + 1,
+                                                           source_name.str()));
+    char* MBStart = MB->getBufferStart();
     memcpy(MBStart, input.data(), InputSize);
     MBStart[InputSize] = '\n';
 
@@ -808,7 +887,7 @@ namespace cling {
 
     // Create SourceLocation, which will allow clang to order the overload
     // candidates for example
-    SourceLocation NewLoc = getLastMemoryBufferEndLoc().getLocWithOffset(1);
+    SourceLocation NewLoc = getNextAvailableUniqueSourceLoc();
 
     llvm::MemoryBuffer* MBNonOwn = MB.get();
 
@@ -839,7 +918,12 @@ namespace cling {
     FilteringDiagConsumer::RAAI RAAITmp(*m_DiagConsumer, CO.IgnorePromptDiags);
 
     DiagnosticErrorTrap Trap(Diags);
+    // FIXME: SavePendingInstantiationsRAII should be obsolvete as
+    // GlobalEagerInstantiationScope and LocalEagerInstantiationScope do the
+    // same thing.
     Sema::SavePendingInstantiationsRAII SavedPendingInstantiations(S);
+    Sema::GlobalEagerInstantiationScope GlobalInstantiations(S, /*Enabled=*/true);
+    Sema::LocalEagerInstantiationScope LocalInstantiations(S);
 
     Parser::DeclGroupPtrTy ADecl;
     while (!m_Parser->ParseTopLevelDecl(ADecl)) {
@@ -867,8 +951,9 @@ namespace cling {
 
       return kSuccess;
     }
-
-#ifdef LLVM_ON_WIN32
+    LocalInstantiations.perform();
+    GlobalInstantiations.perform();
+#ifdef _WIN32
     // Microsoft-specific:
     // Late parsed templates can leave unswallowed "macro"-like tokens.
     // They will seriously confuse the Parser when entering the next
@@ -897,9 +982,6 @@ namespace cling {
     else if (Diags.getNumWarnings())
       return kSuccessWithWarnings;
 
-    if(!m_Interpreter->isInSyntaxOnlyMode() && m_CI->getLangOpts().CUDA )
-      m_CUDACompiler->compileDeviceCode(input, m_Consumer->getTransaction());
-
     return kSuccess;
   }
 
@@ -912,24 +994,33 @@ namespace cling {
   void IncrementalParser::SetTransformers(bool isChildInterpreter) {
     // Add transformers to the IncrementalParser, which owns them
     Sema* TheSema = &m_CI->getSema();
+    // if the interpreter compiles ptx code, some transformers should not be
+    // used
+    bool isCUDADevice = m_Interpreter->getOptions().CompilerOpts.CUDADevice;
     // Register the AST Transformers
     typedef std::unique_ptr<ASTTransformer> ASTTPtr_t;
     std::vector<ASTTPtr_t> ASTTransformers;
     ASTTransformers.emplace_back(new AutoSynthesizer(TheSema));
     ASTTransformers.emplace_back(new EvaluateTSynthesizer(TheSema));
     if (hasCodeGenerator() && !m_Interpreter->getOptions().NoRuntime) {
-       // Don't protect against crashes if we cannot run anything.
-       // cling might also be in a PCH-generation mode; don't inject our Sema pointer
-       // into the PCH.
-       ASTTransformers.emplace_back(new NullDerefProtectionTransformer(m_Interpreter));
+      // Don't protect against crashes if we cannot run anything.
+      // cling might also be in a PCH-generation mode; don't inject our Sema
+      // pointer into the PCH.
+      if (!isCUDADevice && m_Interpreter->getOptions().PtrCheck)
+        ASTTransformers.emplace_back(
+            new NullDerefProtectionTransformer(m_Interpreter));
+      if (isCUDADevice)
+        ASTTransformers.emplace_back(
+            new DeviceKernelInliner(TheSema));
     }
+    ASTTransformers.emplace_back(new DefinitionShadower(*TheSema, *m_Interpreter));
 
     typedef std::unique_ptr<WrapperTransformer> WTPtr_t;
     std::vector<WTPtr_t> WrapperTransformers;
-    if (!m_Interpreter->getOptions().NoRuntime)
+    if (!m_Interpreter->getOptions().NoRuntime && !isCUDADevice)
       WrapperTransformers.emplace_back(new ValuePrinterSynthesizer(TheSema));
     WrapperTransformers.emplace_back(new DeclExtractor(TheSema));
-    if (!m_Interpreter->getOptions().NoRuntime)
+    if (!m_Interpreter->getOptions().NoRuntime && !isCUDADevice)
       WrapperTransformers.emplace_back(new ValueExtractionSynthesizer(TheSema,
                                                            isChildInterpreter));
     WrapperTransformers.emplace_back(new CheckEmptyTransactionTransformer(TheSema));

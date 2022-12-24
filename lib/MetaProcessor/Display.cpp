@@ -110,7 +110,7 @@ static void AppendAnyDeclLocation(const CompilerInstance* compiler,
     const SourceManager &sourceManager = compiler->getSourceManager();
     if (loc.isValid() && sourceManager.isLoadedSourceLocation(loc)) {
       // No line numbers as they would touich disk.
-      baseName = llvm::sys::path::filename(sourceManager.getFilename(loc));
+      baseName = llvm::sys::path::filename(sourceManager.getFilename(loc)).str();
       lineNo = -1;
     } else {
       PresumedLoc ploc(sourceManager.getPresumedLoc(loc));
@@ -196,7 +196,9 @@ void AppendClassName(const CXXRecordDecl* classDecl, std::string& name)
   assert(classDecl != 0 && "AppendClassName, 'classDecl' parameter is null");
 
   const LangOptions langOpts;
-  const PrintingPolicy printingPolicy(langOpts);
+  PrintingPolicy printingPolicy(langOpts);
+  // Print the default template arguments when asking for a class name.
+  printingPolicy.SuppressDefaultTemplateArgs = false;
   std::string tmp;
   //Name for diagnostic will include template arguments if any.
   llvm::raw_string_ostream stream(tmp);
@@ -277,6 +279,7 @@ void AppendMemberFunctionSignature(const Decl* methodDecl, std::string& name)
   const LangOptions langOpts;
   PrintingPolicy printingPolicy(langOpts);
   printingPolicy.TerseOutput = true;//Do not print the body of an inlined function.
+  printingPolicy.SuppressDefaultTemplateArgs = false;
   printingPolicy.SuppressSpecifiers = false; //Show 'static', 'inline', etc.
 
   methodDecl->print(out, printingPolicy, 0, false);
@@ -470,18 +473,19 @@ private:
     //Extract the type of declaration and process it.
     assert(decl != 0 && "ProcessTypeOfMember, 'decl' parameter is null");
 
-    if (const RecordType* const recordType = decl->getType()->template getAs<RecordType>()) {
-      if (const CXXRecordDecl* const classDecl = cast_or_null<CXXRecordDecl>(recordType->getDecl()->getDefinition())) {
-        if (fSeenDecls.find(classDecl) == fSeenDecls.end())
-          DisplayDataMembers(classDecl, nSpaces);
-      }
-    } else if (const ArrayType* const arrayType = decl->getType()->getAsArrayTypeUnsafe()) {
+    if (const ArrayType* const arrayType = decl->getType()->getAsArrayTypeUnsafe()) {
       if (const Type* const elType = arrayType->getBaseElementTypeUnsafe()) {
         if (const RecordType* const recordType = elType->getAs<RecordType>()) {
           if (const CXXRecordDecl* classDecl = cast_or_null<CXXRecordDecl>(recordType->getDecl()->getDefinition()))
             if (fSeenDecls.find(classDecl) == fSeenDecls.end())
               DisplayDataMembers(classDecl, nSpaces);
         }
+      }
+    }
+    else if (const RecordType* const recordType = decl->getType()->template getAs<RecordType>()) {
+      if (const CXXRecordDecl* const classDecl = cast_or_null<CXXRecordDecl>(recordType->getDecl()->getDefinition())) {
+        if (fSeenDecls.find(classDecl) == fSeenDecls.end())
+          DisplayDataMembers(classDecl, nSpaces);
       }
     }
   }
@@ -522,7 +526,7 @@ void ClassPrinter::DisplayAllClasses()const
   const TranslationUnitDecl* const tuDecl = compiler->getASTContext().getTranslationUnitDecl();
   assert(tuDecl != 0 && "DisplayAllClasses, translation unit is empty");
 
-  fOut.Print("List of classes");
+  fOut.Print("List of classes\n");
   // Could trigger deserialization of decls.
   Interpreter::PushTransactionRAII RAII(const_cast<Interpreter*>(fInterpreter));
   for (decl_iterator decl = tuDecl->decls_begin(); decl != tuDecl->decls_end(); ++decl)
@@ -765,15 +769,15 @@ void ClassPrinter::DisplayClassDecl(const CXXRecordDecl* classDecl)const
     fOut.Print("\n");
 
     if (classDecl->bases_begin() != classDecl->bases_end())
-      fOut.Print("Base classes: --------------------------------------------------------\n");
+      fOut.Print("Base classes: -------------------------------------------------------------\n");
 
     DisplayBasesAsTree(classDecl, 0);
     //now list all members.40963410
 
-    fOut.Print("List of member variables --------------------------------------------------\n");
+    fOut.Print("List of member variables: -------------------------------------------------\n");
     DisplayDataMembers(classDecl, 0);
 
-    fOut.Print("List of member functions :---------------------------------------------------\n");
+    fOut.Print("List of member functions: -------------------------------------------------\n");
     //CINT has a format like %-15s blah-blah.
     fOut.Print("filename     line:size busy function type and name\n");
     DisplayMemberFunctions(classDecl);
@@ -1084,6 +1088,8 @@ public:
   void DisplayGlobal(const std::string& name)const;
 
 private:
+  template <typename T, typename... Args>
+  unsigned DisplayDCDecls(const DeclContext *DC, T filter_func, Args... args) const;
 
   void DisplayVarDecl(const VarDecl* varDecl)const;
   void DisplayEnumeratorDecl(const EnumConstantDecl* enumerator)const;
@@ -1104,9 +1110,32 @@ GlobalsPrinter::GlobalsPrinter(llvm::raw_ostream& stream, const cling::Interpret
 }
 
 //______________________________________________________________________________
+template <typename T, typename... Args>
+unsigned GlobalsPrinter::DisplayDCDecls(const DeclContext *DC, T filter_func, Args... args) const
+{
+  unsigned count = 0;
+  for (auto decl = DC->decls_begin(); decl != DC->decls_end(); ++decl) {
+    if (const auto NS = dyn_cast<NamespaceDecl>(*decl)) {
+      if (NS->isInlineNamespace())  // Recursively visit inline namespaces
+        count += DisplayDCDecls(NS, filter_func, args...);
+    } else if (const auto VD = dyn_cast<VarDecl>(*decl)) {
+      if (filter_func(VD, args...))
+        DisplayVarDecl(VD), count++;
+    } else if (auto ED = dyn_cast<EnumDecl>(*decl)) {
+      // Timur.Pocheptsov: it's not really clear, if I should really check this:
+      if (ED->isComplete() && (ED = ED->getDefinition())) {
+        for (auto I = ED->enumerator_begin(); I != ED->enumerator_end(); ++I)
+          if (filter_func(*I, args...))
+            DisplayEnumeratorDecl(*I), count++;
+      }
+    }
+  }
+  return count;
+}
+
+//______________________________________________________________________________
 void GlobalsPrinter::DisplayGlobals()const
 {
-  typedef EnumDecl::enumerator_iterator enumerator_iterator;
   typedef Preprocessor::macro_iterator macro_iterator;
 
   assert(fInterpreter != 0 && "DisplayGlobals, fInterpreter is null");
@@ -1135,24 +1164,12 @@ void GlobalsPrinter::DisplayGlobals()const
   //It's obviously that for objects we can have one definition and any number
   //of declarations, should I print them?
 
-  for (decl_iterator decl = tuDecl->decls_begin(); decl != tuDecl->decls_end(); ++decl) {
-    if (const VarDecl* const varDecl = dyn_cast<VarDecl>(*decl))
-      DisplayVarDecl(varDecl);
-    else if (const EnumDecl* enumDecl = dyn_cast<EnumDecl>(*decl)) {
-      //it's not really clear, if I should really check this:
-      if (enumDecl->isComplete() && (enumDecl = enumDecl->getDefinition())) {
-        for (enumerator_iterator enumerator = enumDecl->enumerator_begin();
-             enumerator != enumDecl->enumerator_end(); ++enumerator)
-          DisplayEnumeratorDecl(*enumerator);
-      }
-    }
-  }
+  DisplayDCDecls(tuDecl, [] (NamedDecl *) { return true; });
 }
 
 //______________________________________________________________________________
 void GlobalsPrinter::DisplayGlobal(const std::string& name)const
 {
-  typedef EnumDecl::enumerator_iterator enumerator_iterator;
   typedef Preprocessor::macro_iterator macro_iterator;
 
   //TODO: is it ok to compare 'name' with decl->getNameAsString() ??
@@ -1165,7 +1182,7 @@ void GlobalsPrinter::DisplayGlobal(const std::string& name)const
   const TranslationUnitDecl* const tuDecl = compiler->getASTContext().getTranslationUnitDecl();
   assert(tuDecl != 0 && "DisplayGlobal, translation unit is empty");
 
-  bool found = false;
+  unsigned count = 0;
 
   // Could trigger deserialization of decls.
   Interpreter::PushTransactionRAII RAII(const_cast<Interpreter*>(fInterpreter));
@@ -1176,35 +1193,16 @@ void GlobalsPrinter::DisplayGlobal(const std::string& name)const
       continue;
     auto MI = MD->getMacroInfo();
     if (MI && MI->isObjectLike()) {
-      if (name == macro->first->getName().data()) {
-        DisplayObjectLikeMacro(macro->first, MI);
-        found = true;
-      }
+      if (name == macro->first->getName().data())
+        DisplayObjectLikeMacro(macro->first, MI), count++;
     }
   }
 
-  for (decl_iterator decl = tuDecl->decls_begin(); decl != tuDecl->decls_end(); ++decl) {
-    if (const VarDecl* const varDecl = dyn_cast<VarDecl>(*decl)) {
-      if (varDecl->getNameAsString() == name) {
-        DisplayVarDecl(varDecl);
-        found = true;
-      }
-    } else if (const EnumDecl* enumDecl = dyn_cast<EnumDecl>(*decl)) {
-      //it's not really clear, if I should really check this:
-      if (enumDecl->isComplete() && (enumDecl = enumDecl->getDefinition())) {
-        for (enumerator_iterator enumerator = enumDecl->enumerator_begin();
-             enumerator != enumDecl->enumerator_end(); ++enumerator) {
-          if (enumerator->getNameAsString() == name) {
-            DisplayEnumeratorDecl(*enumerator);
-            found = true;
-          }
-        }
-      }
-    }
-  }
+  count += DisplayDCDecls(tuDecl, [&name] (NamedDecl *D)
+                                  { return D->getNameAsString() == name; });
 
   //Do as CINT does:
-  if (!found)
+  if (!count)
     fOut.Print(("Variable " + name + " not found\n").c_str());
 }
 
@@ -1421,7 +1419,7 @@ void TypedefPrinter::DisplayTypedefs()const
   const TranslationUnitDecl* const tuDecl = compiler->getASTContext().getTranslationUnitDecl();
   assert(tuDecl != 0 && "DisplayTypedefs, translation unit is empty");
 
-  fOut.Print("List of typedefs");
+  fOut.Print("List of typedefs\n");
   ProcessNestedDeclarations(tuDecl);
 }
 
@@ -1510,6 +1508,7 @@ void TypedefPrinter::DisplayTypedefDecl(TypedefNameDecl* typedefDecl)const
     llvm::raw_string_ostream out(textLine);
     typedefDecl->getUnderlyingType().
        getDesugaredType(typedefDecl->getASTContext()).print(out,printingPolicy);
+    out << ' ';
     //Name for diagnostic will include template arguments if any.
     typedefDecl->getNameForDiagnostic(out,
                                       printingPolicy,/*qualified=*/true);
@@ -1522,33 +1521,18 @@ void TypedefPrinter::DisplayTypedefDecl(TypedefNameDecl* typedefDecl)const
 }//unnamed namespace
 
 //______________________________________________________________________________
-void DisplayClasses(llvm::raw_ostream& stream, const Interpreter* interpreter,
-                    bool verbose)
-{
-  assert(interpreter != 0 && "DisplayClasses, 'interpreter' parameter is null");
-
-  ClassPrinter printer(stream, interpreter);
-  printer.SetVerbose(verbose);
-  printer.DisplayAllClasses();
-}
-
-//______________________________________________________________________________
 void DisplayClass(llvm::raw_ostream& stream, const Interpreter* interpreter,
                   const char* className, bool verbose)
 {
   assert(interpreter != 0 && "DisplayClass, 'interpreter' parameter is null");
-  assert(className != 0 && "DisplayClass, 'className' parameter is null");
-
-  while (std::isspace(*className))
-    ++className;
 
   ClassPrinter printer(stream, interpreter);
-
-  if (*className) {
-    printer.SetVerbose(verbose);
+  printer.SetVerbose(verbose);
+  if (className && *className) {
+    while (std::isspace(*className))
+      ++className;
     printer.DisplayClass(className);
   } else {
-    printer.SetVerbose(true);//?
     printer.DisplayAllClasses();
   }
 }

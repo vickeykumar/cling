@@ -45,7 +45,6 @@ namespace cling {
   class Transaction;
   class TransactionPool;
   class ASTTransformer;
-  class IncrementalCUDADeviceCompiler;
 
   ///\brief Responsible for the incremental parsing and compilation of input.
   ///
@@ -70,6 +69,10 @@ namespace cling {
 
     // file ID of the memory buffer
     clang::FileID m_VirtualFileID;
+
+    // The next available unique sourcelocation offset. Skip the system sloc 0
+    // and any offset that may actually exist in the virtual file.
+    unsigned m_VirtualFileLocOffset = 100;
 
     // CI owns it
     DeclCollector* m_Consumer;
@@ -96,10 +99,6 @@ namespace cling {
     ///\brief DiagnosticConsumer instance
     ///
     std::unique_ptr<clang::DiagnosticConsumer> m_DiagConsumer;
-
-    ///\brief Cling's worker class implementing the compilation of CUDA device code
-    ///
-    std::unique_ptr<IncrementalCUDADeviceCompiler> m_CUDACompiler;
 
     using ModuleFileExtensions =
         std::vector<std::shared_ptr<clang::ModuleFileExtension>>;
@@ -128,7 +127,15 @@ namespace cling {
     clang::Parser* getParser() const { return m_Parser.get(); }
     clang::CodeGenerator* getCodeGenerator() const { return m_CodeGen; }
     bool hasCodeGenerator() const { return m_CodeGen; }
-    clang::SourceLocation getLastMemoryBufferEndLoc() const;
+
+    void setDiagnosticConsumer(clang::DiagnosticConsumer* Consumer, bool Own);
+    clang::DiagnosticConsumer* getDiagnosticConsumer() const;
+
+    /// Returns the next available unique source location. It is an offset into
+    /// the limitless virtual file. Each time this interface is used it bumps
+    /// an internal counter. This is very useful for using the various API in
+    /// clang which expect valid source locations.
+    clang::SourceLocation getNextAvailableUniqueSourceLoc();
 
     /// \{
     /// \name Transaction Support
@@ -186,6 +193,11 @@ namespace cling {
         return 0;
       return m_Transactions.back();
     }
+
+    ///\brief Returns the most recent transaction with an input line wrapper,
+    /// which could well be the current one.
+    ///
+    const Transaction* getLastWrapperTransaction() const;
 
     ///\brief Returns the currently active transaction.
     ///

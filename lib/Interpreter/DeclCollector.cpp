@@ -56,6 +56,7 @@ namespace {
       if (VD->hasGlobalStorage() && !VD->getType().isConstQualified()
           && VD->getTemplateSpecializationKind() == TSK_Undeclared)
         return true;
+
     return false;
   }
 
@@ -95,7 +96,7 @@ namespace cling {
     /// \name PPCallbacks overrides
     /// Macro support
     void MacroUndefined(const clang::Token& MacroNameTok,
-                        const clang::MacroDefinition& MD,
+                        const clang::MacroDefinition& /*MD*/,
                         const clang::MacroDirective* Undef) final {
       if (Undef)
         MacroDirective(MacroNameTok, Undef);
@@ -231,6 +232,18 @@ namespace cling {
         continue;
       }
     } else {
+
+      // FIXME: This is a temporary fix for the ROOT module preloading mechanism.
+      // When we preload modules we would like to enable a module as if we called
+      // clang::Sema::ActOnModuleImport (which does not call HandleTopLevelDecl).
+      // However, we need a valid source locations as modules are very sensitive
+      // to them. In order to have a valid source location,
+      // Interpreter::loadModule calls '#pragma clang module import "A"', which
+      // calls HandleTopLevelDecl which causes CodeGen to run the module
+      // initializers eagerly.
+      if (DGR.isSingleDecl() && isa<ImportDecl>(DGR.getSingleDecl()))
+	return true;
+
       m_Consumer->HandleTopLevelDecl(DGR);
     }
     return true;
@@ -250,22 +263,14 @@ namespace cling {
     Transaction::DelayCallInfo DCI(DeclGroupRef(TD),
                                    Transaction::kCCIHandleTagDeclDefinition);
     m_CurTransaction->append(DCI);
+    if (TD->isInvalidDecl()) {
+       m_CurTransaction->setIssuedDiags(Transaction::kErrors);
+       return;
+    }
     if (m_Consumer
         && (!comesFromASTReader(DeclGroupRef(TD))
             || !shouldIgnore(TD)))
       m_Consumer->HandleTagDeclDefinition(TD);
-  }
-
-  void DeclCollector::HandleInvalidTagDeclDefinition(clang::TagDecl *TD){
-    assertHasTransaction(m_CurTransaction);
-    Transaction::DelayCallInfo DCI(DeclGroupRef(TD),
-                                   Transaction::kCCIHandleTagDeclDefinition);
-    m_CurTransaction->append(DCI);
-    m_CurTransaction->setIssuedDiags(Transaction::kErrors);
-    if (m_Consumer
-        && (!comesFromASTReader(DeclGroupRef(TD))
-            || !shouldIgnore(TD)))
-      m_Consumer->HandleInvalidTagDeclDefinition(TD);
   }
 
   void DeclCollector::HandleVTable(CXXRecordDecl* RD) {
@@ -299,7 +304,7 @@ namespace cling {
     m_Consumer->CompleteTentativeDefinition(VD);
   }
 
-  void DeclCollector::HandleTranslationUnit(ASTContext& Ctx) {
+  void DeclCollector::HandleTranslationUnit(ASTContext& /*Ctx*/) {
     //if (m_Consumer)
     //  m_Consumer->HandleTranslationUnit(Ctx);
   }
